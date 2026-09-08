@@ -3021,6 +3021,7 @@ async fn ingest_event_inner(
             state,
             &event,
             thread_meta.as_ref().map(|m| m.as_params()),
+            &auth.pubkey().to_hex(),
         )
         .await?
         {

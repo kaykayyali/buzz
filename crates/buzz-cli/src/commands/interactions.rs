@@ -87,6 +87,15 @@ pub struct AskArgs {
     json: Option<String>,
 }
 
+/// First poll interval for `wait`; doubles up to [`WAIT_MAX_DELAY`] so a
+/// day-long wait does not issue one HTTP query per second.
+const WAIT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const WAIT_MAX_DELAY: Duration = Duration::from_secs(15);
+
+fn next_wait_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(WAIT_MAX_DELAY)
+}
+
 fn usage(error: impl std::fmt::Display) -> CliError {
     CliError::Usage(error.to_string())
 }
@@ -387,6 +396,7 @@ pub async fn dispatch(cmd: InteractionsCmd, client: &BuzzClient) -> Result<(), C
             let timeout = duration(&timeout)?;
             let (event, schema) = read_prompt(client, &prompt).await?;
             let wait = async {
+                let mut delay = WAIT_INITIAL_DELAY;
                 loop {
                     if let Some(state) = read_state(client, &event, &schema, relay).await? {
                         let summary: Value = serde_json::from_str(&state.content).map_err(usage)?;
@@ -395,7 +405,8 @@ pub async fn dispatch(cmd: InteractionsCmd, client: &BuzzClient) -> Result<(), C
                             return Ok::<(), CliError>(());
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tokio::time::sleep(delay).await;
+                    delay = next_wait_delay(delay);
                 }
             };
             tokio::time::timeout(timeout, wait).await.map_err(|_| {

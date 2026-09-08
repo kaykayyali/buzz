@@ -84,8 +84,11 @@ export function InteractionCard({
     setPending(false);
     setDirty(false);
     setValues({});
-    if (!relay) return;
-    if (signer !== relay || !/^[a-f0-9]{64}$/.test(promptId)) {
+    // A client-signed message carrying an `interaction` tag is not a relay
+    // projection. Retrying cannot change its signer, so it renders as the
+    // plain message it is instead of an error the reader cannot act on.
+    if (!relay || signer !== relay) return;
+    if (!/^[a-f0-9]{64}$/.test(promptId)) {
       setError("This message is not a verified relay interaction.");
       return;
     }

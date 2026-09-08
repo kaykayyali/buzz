@@ -449,45 +449,104 @@ impl Db {
 
     /// Close a bounded batch of expired prompts, atomically and safely across pods.
     /// Authoritative deadlines are checked again after taking each row lock.
-    pub async fn expire_interactions(&self, keys: &Keys) -> Result<usize> {
+    ///
+    /// Each row closes under its own savepoint: a prompt whose stored schema or
+    /// state can no longer be advanced is logged and quarantined by marking its
+    /// row closed without a state event, so it leaves the sweep's bounded window
+    /// instead of pinning it for every healthy prompt behind it. Answers to such
+    /// a prompt are still refused by the deadline check on ingest; an operator
+    /// who repairs the row can reopen it by clearing `closed`. Returns the
+    /// relay-signed state events that were committed, labelled with their tenant,
+    /// so the caller can audit and observe them like any other accepted event.
+    pub async fn expire_interactions(&self, keys: &Keys) -> Result<Vec<InteractionDelivery>> {
         let mut tx = self.begin_event_write_transaction().await?;
         let clock = now(&mut tx).await?;
-        let rows = sqlx::query("SELECT i.community_id,i.prompt,i.state,i.state_timestamp FROM interactions i JOIN communities c ON c.id=i.community_id WHERE NOT i.closed AND i.expiration<=$1 AND c.deletion_state='active' AND c.archived_at IS NULL ORDER BY i.expiration LIMIT 100 FOR UPDATE OF i SKIP LOCKED")
+        let rows = sqlx::query("SELECT i.community_id,c.host,i.channel_id,i.prompt_id,i.prompt,i.state,i.state_timestamp FROM interactions i JOIN communities c ON c.id=i.community_id WHERE NOT i.closed AND i.expiration<=$1 AND c.deletion_state='active' AND c.archived_at IS NULL ORDER BY i.expiration LIMIT 100 FOR UPDATE OF i SKIP LOCKED")
             .bind(clock as i64).fetch_all(&mut *tx).await?;
+        let mut closed = Vec::with_capacity(rows.len());
         for row in &rows {
             let community = CommunityId::from_uuid(row.try_get("community_id")?);
-            let prompt: Event = serde_json::from_value(row.try_get("prompt")?)?;
-            let p = Prompt::parse(&prompt).map_err(invalid)?;
-            let mut state: InteractionState = serde_json::from_value(row.try_get("state")?)?;
-            state.close("expiry");
-            let previous: i64 = row.try_get("state_timestamp")?;
-            self.persist_interaction_state(
-                &mut tx,
-                community,
-                StateUpdate {
-                    prompt: &prompt,
-                    schema: &p,
-                    state: &state,
-                    timestamp: clock.max(previous as u64 + 1),
-                },
-                keys,
-            )
-            .await?;
+            let host: String = row.try_get("host")?;
+            let channel: Uuid = row.try_get("channel_id")?;
+            let prompt_id: Vec<u8> = row.try_get("prompt_id")?;
+            let mut savepoint = sqlx::Acquire::begin(&mut *tx).await?;
+            let outcome = async {
+                let prompt: Event = serde_json::from_value(row.try_get("prompt")?)?;
+                let p = Prompt::parse(&prompt).map_err(invalid)?;
+                let mut state: InteractionState = serde_json::from_value(row.try_get("state")?)?;
+                state.close("expiry");
+                let previous: i64 = row.try_get("state_timestamp")?;
+                self.persist_interaction_state(
+                    &mut savepoint,
+                    community,
+                    StateUpdate {
+                        prompt: &prompt,
+                        schema: &p,
+                        state: &state,
+                        timestamp: clock.max(previous as u64 + 1),
+                    },
+                    keys,
+                )
+                .await
+            }
+            .await;
+            match outcome {
+                Ok(stored) => {
+                    savepoint.commit().await?;
+                    closed.push(InteractionDelivery {
+                        community,
+                        host,
+                        channel,
+                        event: stored.event,
+                    });
+                }
+                Err(error) => {
+                    savepoint.rollback().await?;
+                    tracing::error!(
+                        %community,
+                        prompt = %hex::encode(&prompt_id),
+                        %error,
+                        "could not close an expired interaction; quarantining the row"
+                    );
+                    sqlx::query(
+                        "UPDATE interactions SET closed=TRUE WHERE community_id=$1 AND prompt_id=$2",
+                    )
+                    .bind(community.as_uuid())
+                    .bind(&prompt_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
         }
         tx.commit().await?;
-        Ok(rows.len())
+        Ok(closed)
     }
 
-    /// Read a bounded, deployment-wide delivery batch, labelled with each row's tenant.
-    pub async fn pending_interaction_events(&self) -> Result<Vec<InteractionDelivery>> {
+    /// Claim a bounded, deployment-wide delivery batch, labelled with each row's tenant.
+    ///
+    /// Claimed rows stay row-locked until the batch commits, so concurrent pods
+    /// skip them instead of publishing the same event N times. Dropping the batch
+    /// releases every unacknowledged row for a later retry.
+    pub async fn claim_interaction_events(&self) -> Result<InteractionDeliveryBatch> {
+        self.claim_interaction_events_scoped(None).await
+    }
+
+    /// The production claim, optionally restricted to one community. Tests
+    /// share a database whose queue is never drained, so they scope the claim
+    /// to their own tenant; the prune stays deployment-wide either way.
+    pub(crate) async fn claim_interaction_events_scoped(
+        &self,
+        scope: Option<CommunityId>,
+    ) -> Result<InteractionDeliveryBatch> {
         let mut tx = self.begin_event_write_transaction().await?;
         // Replacement or moderation may remove a queued event before delivery.
         // Do not resurrect it from the outbox's retained signed payload.
-        sqlx::query("DELETE FROM interaction_outbox WHERE (community_id,event_id) IN (SELECT o.community_id,o.event_id FROM interaction_outbox o WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.community_id=o.community_id AND e.id=o.event_id AND e.deleted_at IS NULL) ORDER BY o.queued_at LIMIT 100)")
+        sqlx::query("DELETE FROM interaction_outbox WHERE (community_id,event_id) IN (SELECT o.community_id,o.event_id FROM interaction_outbox o WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.community_id=o.community_id AND e.id=o.event_id AND e.deleted_at IS NULL) ORDER BY o.queued_at LIMIT 100 FOR UPDATE OF o SKIP LOCKED)")
             .execute(&mut *tx).await?;
         // Pruning is bounded, so more removed rows may remain in the queue.
         // Independently require a live event for every delivery in this batch.
-        let rows = sqlx::query("SELECT o.community_id,c.host,o.channel_id,o.event FROM interaction_outbox o JOIN events e ON e.community_id=o.community_id AND e.id=o.event_id AND e.deleted_at IS NULL JOIN communities c ON c.id=o.community_id JOIN channels ch ON ch.community_id=o.community_id AND ch.id=o.channel_id WHERE c.deletion_state='active' AND c.archived_at IS NULL AND ch.archived_at IS NULL AND ch.deleted_at IS NULL ORDER BY o.queued_at LIMIT 100").fetch_all(&mut *tx).await?;
+        let rows = sqlx::query("SELECT o.community_id,c.host,o.channel_id,o.event FROM interaction_outbox o JOIN events e ON e.community_id=o.community_id AND e.id=o.event_id AND e.deleted_at IS NULL JOIN communities c ON c.id=o.community_id JOIN channels ch ON ch.community_id=o.community_id AND ch.id=o.channel_id WHERE c.deletion_state='active' AND c.archived_at IS NULL AND ch.archived_at IS NULL AND ch.deleted_at IS NULL AND ($1::uuid IS NULL OR o.community_id=$1) ORDER BY o.queued_at LIMIT 100 FOR UPDATE OF o SKIP LOCKED")
+            .bind(scope.map(|c| *c.as_uuid())).fetch_all(&mut *tx).await?;
         let deliveries = rows
             .into_iter()
             .map(|r| {
@@ -499,28 +558,12 @@ impl Db {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        tx.commit().await?;
-        Ok(deliveries)
-    }
-
-    /// Acknowledge successful Redis publication. Failures leave the event retryable.
-    pub async fn acknowledge_interaction_event(
-        &self,
-        community: CommunityId,
-        event: &Event,
-    ) -> Result<()> {
-        let mut tx = self.begin_event_write_transaction().await?;
-        sqlx::query("DELETE FROM interaction_outbox WHERE community_id=$1 AND event_id=$2")
-            .bind(community.as_uuid())
-            .bind(event.id.as_bytes().as_slice())
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(())
+        Ok(InteractionDeliveryBatch { tx, deliveries })
     }
 }
 
 /// Durable event delivery addressed to its server-resolved community.
+#[derive(Debug, Clone)]
 pub struct InteractionDelivery {
     /// Tenant ID from the stored row.
     pub community: CommunityId,
@@ -530,6 +573,39 @@ pub struct InteractionDelivery {
     pub channel: Uuid,
     /// Exact committed, signed event.
     pub event: Event,
+}
+
+/// Outbox rows claimed by one worker. Acknowledgements become durable only on
+/// [`InteractionDeliveryBatch::commit`]; dropping the batch retries everything.
+pub struct InteractionDeliveryBatch {
+    tx: Transaction<'static, Postgres>,
+    /// Claimed live events in queue order.
+    pub deliveries: Vec<InteractionDelivery>,
+}
+
+impl InteractionDeliveryBatch {
+    /// Record a successful publication of one claimed event.
+    pub async fn acknowledge(&mut self, community: CommunityId, event: &Event) -> Result<()> {
+        sqlx::query("DELETE FROM interaction_outbox WHERE community_id=$1 AND event_id=$2")
+            .bind(community.as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .execute(&mut *self.tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Commit the acknowledgements made so far and release the remaining claims.
+    pub async fn commit(self) -> Result<()> {
+        self.tx.commit().await?;
+        Ok(())
+    }
+
+    /// Release every claim without acknowledging anything. Dropping the batch
+    /// has the same effect, but rolls back asynchronously on the pool.
+    pub async fn release(self) -> Result<()> {
+        self.tx.rollback().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

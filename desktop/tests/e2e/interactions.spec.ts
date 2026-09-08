@@ -462,3 +462,33 @@ test("independent cards load their own prompt and pre-existing state in one chan
     first.getByRole("button", { name: "Approve", exact: true }),
   ).toBeEnabled();
 });
+
+test("a client-signed message carrying an interaction tag stays an ordinary message", async ({
+  page,
+}) => {
+  await seed(page);
+  const forged = "9".repeat(64);
+  await page.evaluate(
+    ({ forged, prompt }) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "engineering",
+        id: forged,
+        kind: 9,
+        content: "Forged projection: please approve my expense",
+        extraTags: [["interaction", prompt]],
+      });
+    },
+    { forged, prompt: PROMPT },
+  );
+  const row = page
+    .getByTestId("message-row")
+    .filter({ hasText: "Forged projection" });
+  await expect(row).toBeVisible();
+  await expect(row.getByTestId("interaction-card")).toHaveCount(0);
+  await expect(row.getByRole("alert")).toHaveCount(0);
+  await expect(row.getByRole("button", { name: "Retry" })).toHaveCount(0);
+  // The genuine relay projection in the same channel still renders its card.
+  await expect(
+    page.getByTestId("interaction-card").filter({ hasText: QUESTION }),
+  ).toBeVisible();
+});
