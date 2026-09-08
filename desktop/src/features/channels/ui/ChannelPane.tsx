@@ -6,6 +6,7 @@ import { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
 import { ComposerDockBackdrop } from "@/features/messages/ui/ComposerDockBackdrop";
 import { ComposerUploadProgressOverlay } from "@/features/messages/ui/ComposerUploadProgressOverlay";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
+import { AskInteractionButton } from "@/features/interactions/AskInteractionButton";
 import { ComposerTimeoutBanner } from "@/features/moderation/ui/ComposerTimeoutBanner";
 import { useTimeoutState } from "@/features/moderation/lib/timeoutStore";
 import { isModerationDm } from "@/features/moderation/lib/moderationDm";
@@ -267,6 +268,16 @@ export const ChannelPane = React.memo(function ChannelPane({
     timeoutState.active ||
     isModerationDmChannel ||
     isSending;
+  // Memoized so the memoized composer does not re-render for a fresh element.
+  const askInteractionAction = React.useMemo(
+    () => (
+      <AskInteractionButton
+        channelId={activeChannel?.id ?? null}
+        disabled={isComposerDisabled}
+      />
+    ),
+    [activeChannel?.id, isComposerDisabled],
+  );
   const knownAgentPubkeys = React.useMemo(() => {
     const pubkeys = new Set<string>();
     for (const pubkey of agentPubkeys ?? []) {
@@ -778,6 +789,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                     onSend={handleSendMessage}
                     {...{ profiles, recentMentionPubkeys: recentMentions }}
                     showBackgroundUploadProgress={false}
+                    toolbarExtraActions={askInteractionAction}
                     placeholder={
                       timeoutState.active
                         ? "You're timed out by community moderators."

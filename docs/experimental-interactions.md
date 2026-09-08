@@ -21,7 +21,13 @@ are disabled, and the capability is not advertised. Existing history is retained
 Re-enabling processes overdue prompts and pending delivery records.
 
 In desktop Settings → Experimental Features, enable **Interaction cards**. The
-relay flag controls acceptance; the desktop toggle controls rendering only.
+relay flag controls acceptance; the desktop toggle controls rendering and the
+composer's **Ask for a decision** action, which composes, signs and publishes a
+buttons, poll or form prompt into the open channel. The dialog applies the
+relay's schema rules before signing (option and field identifiers, per-type
+counts, choice bounds, close rules, a 30-day deadline) and shows the relay's
+own reason if it still rejects the event, for example when the experiment is
+off on that relay. Listed responders and thread replies remain CLI-only.
 Clients can discover `buzz-interactions-v1` in `/info`'s
 `supported_extensions` and the relay's public key in `self`.
 
@@ -193,9 +199,10 @@ Native interaction workflow triggers are not introduced in this slice.
 
 This contribution intentionally does **not** claim all five rollout phases are
 complete. Remaining work includes durable `request_input` workflow suspension
-and outputs, migration of approvals, desktop `/ask` and `/poll` authoring and a
-workflow editor, ACP/Hermes transport adapters, interaction-specific push
-navigation, native mobile cards, and any encrypted/private ballot protocol.
+and outputs, migration of approvals, `/ask` and `/poll` slash commands and a
+workflow editor (the composer dialog covers desktop authoring), ACP/Hermes
+transport adapters, interaction-specific push navigation, native mobile cards,
+and any encrypted/private ballot protocol.
 Agents can already use the CLI's ask/answer/wait path without an adapter.
 An automatic agent action must still enforce its existing author allow list.
 Upgrade `buzz-acp` with the relay before targeting agents: this slice verifies
@@ -235,12 +242,15 @@ BUZZ_TEST_DATABASE_URL=postgres://... \
 
 Desktop tests exercise keyboard button submission, native form validation,
 poll selection, foreign/stale state, the default-off text fallback, and a
-client-signed message that carries an `interaction` tag rendering as plain text:
+client-signed message that carries an `interaction` tag rendering as plain text.
+Authoring tests cover the hidden action when the experiment is off, local
+validation that keeps the draft, and the signed buttons, poll and form events:
 
 ```sh
 cd desktop
+pnpm test
 pnpm build:e2e
-pnpm exec playwright test --project=smoke interactions.spec.ts
+pnpm exec playwright test --project=smoke interactions.spec.ts interaction-authoring.spec.ts
 ```
 
 Run `just ci` and the repository's relay integration suite (`just test`) before

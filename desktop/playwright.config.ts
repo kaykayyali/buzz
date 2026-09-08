@@ -161,6 +161,7 @@ export default defineConfig({
         "**/settings-section-layout.spec.ts",
         "**/experimental-features.spec.ts",
         "**/interactions.spec.ts",
+        "**/interaction-authoring.spec.ts",
         "**/agent-provider-dropdowns.spec.ts",
         "**/agent-lifecycle-feedback.spec.ts",
         "**/agent-access-warning.spec.ts",
