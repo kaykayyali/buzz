@@ -10,6 +10,11 @@ import { AskInteractionDialog } from "./AskInteractionDialog";
  * Composer action that opens the prompt authoring dialog. Renders nothing
  * unless the "Interaction cards" experimental feature is enabled, so default
  * builds keep their toolbar unchanged.
+ *
+ * The dialog is pinned to the channel it was opened for: it publishes only
+ * to that channel, closes if the active channel changes underneath it, and
+ * its draft is keyed per channel so text written for one channel is never
+ * carried into another.
  */
 export const AskInteractionButton = React.memo(function AskInteractionButton({
   channelId,
@@ -19,8 +24,9 @@ export const AskInteractionButton = React.memo(function AskInteractionButton({
   disabled?: boolean;
 }) {
   const enabled = useFeatureEnabled("interactions");
-  const [open, setOpen] = React.useState(false);
+  const [openFor, setOpenFor] = React.useState<string | null>(null);
   if (!enabled) return null;
+  const open = openFor !== null && openFor === channelId;
   return (
     <>
       <Tooltip disableHoverableContent>
@@ -29,7 +35,7 @@ export const AskInteractionButton = React.memo(function AskInteractionButton({
             aria-label="Ask for a decision"
             data-testid="ask-interaction"
             disabled={disabled || !channelId}
-            onClick={() => setOpen(true)}
+            onClick={() => setOpenFor(channelId)}
             size="icon"
             type="button"
             variant="ghost"
@@ -39,11 +45,14 @@ export const AskInteractionButton = React.memo(function AskInteractionButton({
         </TooltipTrigger>
         <TooltipContent>Ask for a decision</TooltipContent>
       </Tooltip>
-      <AskInteractionDialog
-        channelId={channelId}
-        open={open}
-        onOpenChange={setOpen}
-      />
+      {channelId ? (
+        <AskInteractionDialog
+          key={channelId}
+          channelId={channelId}
+          open={open}
+          onOpenChange={(next) => setOpenFor(next ? channelId : null)}
+        />
+      ) : null}
     </>
   );
 });

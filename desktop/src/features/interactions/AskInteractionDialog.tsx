@@ -70,7 +70,8 @@ export function AskInteractionDialog({
   open,
   onOpenChange,
 }: {
-  channelId: string | null;
+  /** The channel this dialog publishes to; fixed for the dialog's lifetime. */
+  channelId: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -125,7 +126,7 @@ export function AskInteractionDialog({
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (submitting.current || !channelId) return;
+    if (submitting.current) return;
     let unsigned: ReturnType<typeof buildPrompt>;
     try {
       unsigned = buildPrompt(draft, channelId);
@@ -510,7 +511,7 @@ export function AskInteractionDialog({
             >
               Cancel
             </Button>
-            <Button disabled={pending || !channelId} type="submit">
+            <Button disabled={pending} type="submit">
               {pending
                 ? "Sending…"
                 : draft.type === "poll"

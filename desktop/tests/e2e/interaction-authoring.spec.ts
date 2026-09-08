@@ -3,11 +3,18 @@ import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
 
 const RELAY = "a".repeat(64);
+// Mock #engineering (desktop/src/testing/e2eBridge.ts): every prompt must be
+// scoped to the channel the dialog was opened in.
+const ENGINEERING = "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9";
 
-async function openEngineering(page: Page, enabled = true) {
+async function openEngineering(
+  page: Page,
+  enabled = true,
+  rejectEventKinds: number[] = [],
+) {
   await installMockBridge(
     page,
-    { relaySelf: RELAY },
+    { relaySelf: RELAY, rejectEventKinds },
     { seedPreviewFeatures: enabled },
   );
   await page.goto("/");
@@ -15,11 +22,26 @@ async function openEngineering(page: Page, enabled = true) {
   await expect(page.getByTestId("message-composer-toolbar")).toBeVisible();
 }
 
-const signedPrompts = (page: Page) =>
-  page.evaluate(
-    () =>
-      window.__BUZZ_E2E_SIGNED_EVENTS__?.filter((e) => e.kind === 40010) ?? [],
-  );
+/**
+ * Prompts the mock relay accepted over the WebSocket, paired with its `OK`.
+ * Signing alone proves nothing reached the relay, so success assertions read
+ * the published events and their acknowledgements.
+ */
+const publishedPrompts = (page: Page) =>
+  page.evaluate(() => {
+    const oks = window.__BUZZ_E2E_RELAY_OKS__ ?? [];
+    return (window.__BUZZ_E2E_PUBLISHED_EVENTS__ ?? [])
+      .filter((e) => e.kind === 40010)
+      .map((e) => ({ ...e, ok: oks.find((ok) => ok.id === e.id) ?? null }));
+  });
+
+async function expectOneAcceptedPrompt(page: Page) {
+  await expect.poll(() => publishedPrompts(page)).toHaveLength(1);
+  const [prompt] = await publishedPrompts(page);
+  expect(prompt.ok).toEqual({ id: prompt.id, accepted: true, message: "" });
+  expect(prompt.tags).toContainEqual(["h", ENGINEERING]);
+  return prompt;
+}
 
 test("the composer action is hidden until the experiment is enabled", async ({
   page,
@@ -38,7 +60,7 @@ test("a buttons request is validated locally, then signed and published", async 
   // Empty question: a specific message, nothing signed.
   await dialog.getByRole("button", { name: "Ask", exact: true }).click();
   await expect(dialog.getByRole("alert")).toContainText("Write the question");
-  expect(await signedPrompts(page)).toHaveLength(0);
+  expect(await publishedPrompts(page)).toHaveLength(0);
 
   await dialog.getByLabel("Question").fill("Render **The Door**?");
   await dialog.getByRole("button", { name: "Add option" }).click();
@@ -54,8 +76,7 @@ test("a buttons request is validated locally, then signed and published", async 
   await dialog.getByRole("button", { name: "Ask", exact: true }).click();
   await expect(dialog).toBeHidden();
 
-  await expect.poll(() => signedPrompts(page)).toHaveLength(1);
-  const [prompt] = await signedPrompts(page);
+  const prompt = await expectOneAcceptedPrompt(page);
   expect(prompt.tags).toContainEqual(["itype", "buttons"]);
   expect(prompt.tags).toContainEqual(["closes", "quorum:2"]);
   expect(prompt.tags).toContainEqual(["responders", "role:admin"]);
@@ -95,8 +116,7 @@ test("a poll carries bounded multi-select and keeps entered options on a validat
   await dialog.getByLabel("at most").fill("2");
   await start.click();
   await expect(dialog).toBeHidden();
-  await expect.poll(() => signedPrompts(page)).toHaveLength(1);
-  const [poll] = await signedPrompts(page);
+  const poll = await expectOneAcceptedPrompt(page);
   expect(poll.tags).toContainEqual(["itype", "poll"]);
   expect(poll.tags).toContainEqual(["closes", "expiry"]);
   expect(poll.tags).toContainEqual(["min", "1"]);
@@ -121,8 +141,7 @@ test("a form publishes typed fields with select choices", async ({ page }) => {
   await dialog.getByLabel("Field 2 choices").fill("60s, 6min");
   await dialog.getByRole("button", { name: "Ask", exact: true }).click();
   await expect(dialog).toBeHidden();
-  await expect.poll(() => signedPrompts(page)).toHaveLength(1);
-  const [form] = await signedPrompts(page);
+  const form = await expectOneAcceptedPrompt(page);
   expect(form.tags).toContainEqual(["itype", "form"]);
   expect(form.tags).toContainEqual([
     "field",
@@ -141,4 +160,21 @@ test("a form publishes typed fields with select choices", async ({ page }) => {
   expect(form.tags).toContainEqual(["optsel", "length", "60s"]);
   expect(form.tags).toContainEqual(["optsel", "length", "6min"]);
   expect(form.tags.some((t) => t[0] === "opt" || t[0] === "min")).toBe(false);
+});
+
+test("a relay that refuses the prompt leaves the dialog open with its reason", async ({
+  page,
+}) => {
+  await openEngineering(page, true, [40010]);
+  await page.getByTestId("ask-interaction").click();
+  const dialog = page.getByTestId("ask-interaction-dialog");
+  await dialog.getByLabel("Question").fill("Ship it?");
+  await dialog.getByRole("button", { name: "Ask", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("restricted");
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel("Question")).toHaveValue("Ship it?");
+  await expect.poll(() => publishedPrompts(page)).toHaveLength(1);
+  const [refused] = await publishedPrompts(page);
+  expect(refused.ok?.accepted).toBe(false);
+  expect(refused.tags).toContainEqual(["h", ENGINEERING]);
 });

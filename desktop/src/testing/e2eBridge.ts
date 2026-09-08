@@ -512,6 +512,8 @@ type E2eConfig = {
     /** Delay (ms) applied to `get_relay_self` so E2E tests can prove the
      *  fail-closed race: DMs are withheld while classification is unresolved. */
     relaySelfDelayMs?: number;
+    /** Kinds the mock relay refuses with a NIP-01 `OK false` and a restricted reason. */
+    rejectEventKinds?: number[];
     /** Delay (ms) applied to `start_pairing` so pairing loading UI is observable. */
     pairingStartDelayMs?: number;
     /**
@@ -1346,6 +1348,14 @@ declare global {
       createdAt?: number;
       kind: number;
       tags: string[][];
+    }>;
+    /** Every EVENT the client published to the mock relay, in order. */
+    __BUZZ_E2E_PUBLISHED_EVENTS__?: RelayEvent[];
+    /** Every `OK` the mock relay sent for a client-published EVENT, in order. */
+    __BUZZ_E2E_RELAY_OKS__?: Array<{
+      id: string;
+      accepted: boolean;
+      message: string;
     }>;
     /** Omits kind 30621 seeds while retaining standalone kind 30617 repositories. */
     __BUZZ_E2E_REPOSITORY_ONLY_PROJECTS__?: boolean;
@@ -4518,6 +4528,13 @@ function resolveRawHandler(handler: unknown): WsHandler {
 }
 
 function sendWsText(handler: WsHandler, payload: unknown[]) {
+  if (payload[0] === "OK" && typeof payload[1] === "string") {
+    window.__BUZZ_E2E_RELAY_OKS__?.push({
+      id: payload[1],
+      accepted: payload[2] === true,
+      message: typeof payload[3] === "string" ? payload[3] : "",
+    });
+  }
   handler({
     type: "Text",
     data: JSON.stringify(payload),
@@ -11077,6 +11094,16 @@ function sendToMockSocket(args: {
 
   if (type === "EVENT") {
     const event = rest[0] as RelayEvent;
+    window.__BUZZ_E2E_PUBLISHED_EVENTS__?.push(event);
+    if (getConfig()?.mock?.rejectEventKinds?.includes(event.kind)) {
+      sendWsText(socket.handler, [
+        "OK",
+        event.id,
+        false,
+        `restricted: kind ${event.kind} is not enabled on this relay`,
+      ]);
+      return;
+    }
 
     if (event.kind === KIND_AGENT_OBSERVER_FRAME) {
       const frame = event.tags.find((tag) => tag[0] === "frame")?.[1];
@@ -11508,6 +11535,8 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_EMIT_MOCK_HUDDLE_TTS_SPEAKER__ = (payload) =>
     emit("huddle-tts-speaker-level", payload);
   window.__BUZZ_E2E_SIGNED_EVENTS__ = [];
+  window.__BUZZ_E2E_RELAY_OKS__ = [];
+  window.__BUZZ_E2E_PUBLISHED_EVENTS__ = [];
   window.__BUZZ_E2E_WEBVIEW_ZOOM__ = 1;
   window.__BUZZ_E2E_EMIT_MEDIA_UPLOAD_PHASE__ = async (input) => {
     await emit("media-upload-phase", input);
