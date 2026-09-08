@@ -57,8 +57,9 @@ For listed responders, use `--responders listed --responder <pubkey>` repeatedly
 Writes use the existing `{event_id, accepted, message}` JSON contract. `get`
 returns `[signed_prompt, signed_state]`, or just the prompt if no state was
 returned. `wait` returns `[signed_final_state]`; its content is a JSON string.
-It uses bounded HTTP polling and returns exit code 4 on timeout, never an
-inferred denial or approval. Other exit codes follow the existing CLI contract.
+It polls over HTTP with a delay that doubles from one second to a 15-second
+cap and returns exit code 4 on timeout, never an inferred denial or approval.
+Other exit codes follow the existing CLI contract.
 The original response event IDs in state can be queried through the ordinary
 Nostr bridge to inspect comments, form values and signatures.
 
@@ -136,9 +137,10 @@ avoid same-second addressable replacement races. During a burst they may lead
 wall time. Readers render by **revision**; they do not count raw response events
 or treat the state timestamp as the time of a person's decision. A prompt caps
 at 256 distinct responders and 4096 answer transitions to bound snapshot growth
-and clock advancement. Content is capped at 16 KiB and schema tags at 32 KiB;
-answer values total at most 8 KiB. Prompt creation is limited to ten per minute
-per key and 32 unexpired open prompts per channel.
+and clock advancement. Content is capped at 16 KiB and schema tags at 512 tags
+and 32 KiB, which leaves room for a full 256-key responder list; answer values
+total at most 8 KiB. Prompt creation is limited to ten per minute per key and
+32 unexpired open prompts per channel.
 
 ## Compatibility, persistence and failure behavior
 
@@ -154,24 +156,38 @@ the ordinary message path and do not cast a vote.
 The original message and relay synthesis are separate, verifiable signatures.
 A later typed answer replaces that same author's text answer. The relay never
 signs as a user. The projection is an explanation of the prompt; the original
-signed prompt remains the authoritative question and schema.
+signed prompt remains the authoritative question and schema. While the
+experiment is enabled, an ordinary client-signed message carrying a `via`,
+`actor` or `interaction` tag is rejected at ingest, so nothing but the relay's
+own projection can present itself as one; aware clients additionally render a
+non-relay signer as the plain message it is.
 
 The shared HTTP/WebSocket ingest path authenticates the event and checks the
 experiment before the interaction transaction. A row lock serializes answers
 and close operations; membership/role rows are read on the writer and locked
 during acceptance. The source event, updated snapshot, signed state and delivery
 records commit together. A durable outbox retries Redis publication after
-failure or restart. Delivery is at least once; consumers deduplicate by event ID
-and state revision. Historical reads work independently of delivery progress.
-Queued events removed by replacement or moderation are discarded rather than
-replayed. Community and channel boundaries are carried through delivery and the
-existing recipient access gate. The standard event audit path is reused.
+failure or restart. Each worker tick claims a bounded batch with
+`FOR UPDATE SKIP LOCKED`, publishes it, and acknowledges inside the same
+transaction, so concurrent pods deliver disjoint rows; a publication failure
+commits the acknowledgements made so far and leaves the rest for the next tick.
+Delivery is therefore at least once only across a crash between publish and
+commit; consumers still deduplicate by event ID and state revision. Historical
+reads work independently of delivery progress. Queued events removed by
+replacement or moderation are discarded rather than replayed. Community and
+channel boundaries are carried through delivery and the existing recipient
+access gate. The standard event audit path is reused at acceptance: every
+committed event is audited once, on the ingesting pod, with the authenticated
+actor, never per delivery attempt; states closed by the expiry sweep are
+audited by the worker with the relay identity.
 
-Expiry uses a bounded worker with `FOR UPDATE SKIP LOCKED` across pods. Every
-answer checks the database clock after acquiring the prompt lock, so a delayed
-sweep cannot accept a late vote. Text answers retain ordinary message workflow
-triggers with the existing post-commit semantics. Native interaction workflow
-triggers are not introduced in this slice.
+Expiry uses a bounded worker with `FOR UPDATE SKIP LOCKED` across pods. Each
+expired prompt closes under its own savepoint, so a row whose stored schema or
+state can no longer be advanced is logged and skipped rather than blocking the
+rest of the sweep. Every answer checks the database clock after acquiring the
+prompt lock, so a delayed sweep cannot accept a late vote. Text answers retain
+ordinary message workflow triggers with the existing post-commit semantics.
+Native interaction workflow triggers are not introduced in this slice.
 
 ## Follow-up slices
 
@@ -199,12 +215,18 @@ both tables and the outbox. Community deletion includes both tables.
 
 ## Validation
 
-Core tests exercise schema errors, form types, replacement, deduplication,
-first/quorum/expiry and deterministic equal-timestamp ordering. PostgreSQL tests
-bind `Db::accept_interaction` and cover concurrent first-close, authorization,
-tenant/channel isolation, fallback identity, rollback on failed state writes,
-expiry before the worker runs, and removed outbox backlogs larger than one
-cleanup batch. Run them with the repository's real database:
+Core tests exercise envelope limits, reserved provenance tags, per-type schema
+limits, tag helpers, text-answer matching, field formats and value sizes, the
+responder cap, replacement, deduplication, first/quorum/expiry and
+deterministic equal-timestamp ordering. PostgreSQL tests bind
+`Db::accept_interaction`, `Db::expire_interactions` and the claim-based outbox
+and cover concurrent first-close, authorization, tenant/channel isolation,
+fallback identity, prompt-reply and relay-reply filtering, listed responders,
+asker close and replay idempotency, quorum counting, per-key and per-channel
+prompt limits, rollback on failed state writes, expiry before the worker runs,
+poison rows during the sweep, claimed rows hidden from concurrent workers, and
+removed outbox backlogs larger than one cleanup batch. They share one database
+and are safe to run in parallel. Run them with the repository's real database:
 
 ```sh
 BUZZ_TEST_DATABASE_URL=postgres://... \
@@ -212,7 +234,8 @@ BUZZ_TEST_DATABASE_URL=postgres://... \
 ```
 
 Desktop tests exercise keyboard button submission, native form validation,
-poll selection, foreign/stale state and the default-off text fallback:
+poll selection, foreign/stale state, the default-off text fallback, and a
+client-signed message that carries an `interaction` tag rendering as plain text:
 
 ```sh
 cd desktop

@@ -18,6 +18,10 @@ pub const EXTENSION: &str = "buzz-interactions-v1";
 pub const MAX_LIFETIME: u64 = 30 * 24 * 60 * 60;
 /// Maximum distinct responders to one experimental prompt.
 pub const MAX_RESPONDERS: usize = 256;
+/// Maximum tags on one interaction event. Leaves room for a full listed
+/// responder set plus the largest schema (fields, options, select values);
+/// total tag bytes are bounded separately.
+pub const MAX_TAGS: usize = 512;
 
 /// Invalid or unsupported interaction input.
 #[derive(Debug, thiserror::Error)]
@@ -153,7 +157,7 @@ pub fn validate_envelope(event: &Event) -> Result<()> {
         ));
     }
     if event.content.len() > 16_384
-        || event.tags.len() > 128
+        || event.tags.len() > MAX_TAGS
         || event
             .tags
             .iter()
