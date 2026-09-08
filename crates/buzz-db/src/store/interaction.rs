@@ -451,8 +451,11 @@ impl Db {
     /// Authoritative deadlines are checked again after taking each row lock.
     ///
     /// Each row closes under its own savepoint: a prompt whose stored schema or
-    /// state can no longer be advanced is logged and skipped, so one poison row
-    /// cannot block expiry for every other prompt in the deployment. Returns the
+    /// state can no longer be advanced is logged and quarantined by marking its
+    /// row closed without a state event, so it leaves the sweep's bounded window
+    /// instead of pinning it for every healthy prompt behind it. Answers to such
+    /// a prompt are still refused by the deadline check on ingest; an operator
+    /// who repairs the row can reopen it by clearing `closed`. Returns the
     /// relay-signed state events that were committed, labelled with their tenant,
     /// so the caller can audit and observe them like any other accepted event.
     pub async fn expire_interactions(&self, keys: &Keys) -> Result<Vec<InteractionDelivery>> {
@@ -503,8 +506,15 @@ impl Db {
                         %community,
                         prompt = %hex::encode(&prompt_id),
                         %error,
-                        "could not close an expired interaction; skipping it this sweep"
+                        "could not close an expired interaction; quarantining the row"
                     );
+                    sqlx::query(
+                        "UPDATE interactions SET closed=TRUE WHERE community_id=$1 AND prompt_id=$2",
+                    )
+                    .bind(community.as_uuid())
+                    .bind(&prompt_id)
+                    .execute(&mut *tx)
+                    .await?;
                 }
             }
         }

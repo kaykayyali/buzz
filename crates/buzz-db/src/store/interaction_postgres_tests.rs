@@ -405,12 +405,42 @@ async fn expiry_sweep_skips_a_poison_row_and_still_closes_the_rest() {
         interaction::single_tag(&d.event, "d").unwrap() == Some(healthy.id.to_hex().as_str())
     }));
     assert!(f.closed(&healthy).await);
-    assert!(
-        !f.closed(&poison).await,
-        "the poison row stays open for an operator"
-    );
     assert_eq!(
         f.state(&healthy).await.close_reason.as_deref(),
+        Some("expiry")
+    );
+    // The poison row is quarantined: marked closed with no state transition, so
+    // it leaves the bounded sweep window instead of pinning it forever.
+    assert!(f.closed(&poison).await);
+    let raw: serde_json::Value =
+        sqlx::query_scalar("SELECT state FROM interactions WHERE community_id=$1 AND prompt_id=$2")
+            .bind(f.community.as_uuid())
+            .bind(poison.id.as_bytes().as_slice())
+            .fetch_one(&f.db.pool)
+            .await
+            .unwrap();
+    assert!(raw["close_reason"].is_null());
+    assert!(f
+        .db
+        .expire_interactions(&f.relay)
+        .await
+        .unwrap()
+        .iter()
+        .all(|d| d.community != f.community));
+    // An operator who repairs the row can reopen it for the next sweep.
+    sqlx::query(
+        "UPDATE interactions SET prompt=$3, closed=FALSE WHERE community_id=$1 AND prompt_id=$2",
+    )
+    .bind(f.community.as_uuid())
+    .bind(poison.id.as_bytes().as_slice())
+    .bind(serde_json::to_value(&poison).unwrap())
+    .execute(&f.db.pool)
+    .await
+    .unwrap();
+    let repaired = f.sweep_until_closed(&poison).await;
+    assert!(repaired.len() <= 1);
+    assert_eq!(
+        f.state(&poison).await.close_reason.as_deref(),
         Some("expiry")
     );
 }
