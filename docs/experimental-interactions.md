@@ -183,8 +183,10 @@ audited by the worker with the relay identity.
 
 Expiry uses a bounded worker with `FOR UPDATE SKIP LOCKED` across pods. Each
 expired prompt closes under its own savepoint, so a row whose stored schema or
-state can no longer be advanced is logged and skipped rather than blocking the
-rest of the sweep. Every answer checks the database clock after acquiring the
+state can no longer be advanced is logged and quarantined (marked closed with
+no state event, which ingest already refuses past the deadline) rather than
+pinning the sweep's bounded window; an operator who repairs the row can clear
+`closed` to let the next sweep finish it. Every answer checks the database clock after acquiring the
 prompt lock, so a delayed sweep cannot accept a late vote. Text answers retain
 ordinary message workflow triggers with the existing post-commit semantics.
 Native interaction workflow triggers are not introduced in this slice.
